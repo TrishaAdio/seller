@@ -20,6 +20,7 @@ from telethon.errors import (
 )
 from telethon.tl.types import InputPeerUser
 
+import buttons as buttons_store
 import config
 
 
@@ -28,16 +29,25 @@ def build_bot() -> TelegramClient:
     return TelegramClient(config.BOT_SESSION, config.API_ID, config.API_HASH)
 
 
+async def _resolve_peer(bot: TelegramClient, user_id: int):
+    """Real access hash from cache if known, else access_hash 0 as a fallback."""
+    try:
+        return await bot.get_input_entity(user_id)
+    except (ValueError, TypeError):
+        return InputPeerUser(user_id, 0)
+
+
 async def dm_user(bot: TelegramClient, user_id: int, first_name: str | None) -> str:
-    """Send the invite DM to one user.
+    """Send the fallback text DM to one user.
 
     Returns a status string: "sent", "blocked", "invalid", "deleted",
     "is_bot", or "flood:<seconds>". Raises nothing for expected failures.
     """
-    peer = InputPeerUser(user_id, 0)
+    peer = await _resolve_peer(bot, user_id)
     text = config.render_message(first_name)
     try:
-        await bot.send_message(peer, text, link_preview=False)
+        await bot.send_message(peer, text, link_preview=False,
+                               buttons=buttons_store.to_markup())
         return "sent"
     except FloodWaitError as e:
         return f"flood:{e.seconds}"

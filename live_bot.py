@@ -16,8 +16,10 @@ Owner commands (DM the bot):
   /start              show help
   /setpost            reply to a message to save it as THE post
   /clearpost          forget the saved post
+  /setbutton          set inline URL buttons for the post
+  /clearbutton        remove the buttons
   /preview            send the saved post to yourself
-  /stats              audience size + whether a post is set
+  /stats              audience size + post/button status
   /broadcast          push the saved post (or a replied post) to everyone
   /cancel             stop a running broadcast
 
@@ -33,10 +35,11 @@ from __future__ import annotations
 import asyncio
 
 from telethon import TelegramClient, events
-from telethon.tl.types import InputPeerUser, UpdateBotChatInviteRequester
+from telethon.tl.types import UpdateBotChatInviteRequester
 
 import audience
 import broadcast
+import buttons
 import config
 import saved_post
 from bot_dm import dm_user
@@ -57,28 +60,37 @@ def build_bot() -> TelegramClient:
     config.require("API_ID", "API_HASH", "BOT_TOKEN")
     bot = TelegramClient(config.BOT_SESSION, config.API_ID, config.API_HASH)
 
-    async def welcome(user_id: int, first_name: str | None) -> str:
-        """Send the saved post to one user; fall back to the text template."""
+    async def welcome(peer, first_name: str | None) -> str:
+        """Send the saved post to one user; fall back to the text template.
+
+        `peer` is the resolved entity when we have it (carries the access hash
+        so the send actually goes through), or the raw user id otherwise.
+        """
         src = await broadcast.resolve_saved(bot)
         if src is not None:
-            return await broadcast._copy_to(bot, user_id, src)
+            return await broadcast._copy_to(bot, peer, src)
         if config.has_text_template():
-            return await dm_user(bot, user_id, first_name)
+            uid = peer if isinstance(peer, int) else peer.id
+            return await dm_user(bot, uid, first_name)
         return "no_post"  # nothing configured yet — just collected
 
     # --- 1. New join requests -> auto-welcome + remember for broadcasts ----
     @bot.on(events.Raw(UpdateBotChatInviteRequester))
     async def on_request(update: UpdateBotChatInviteRequester):
         uid = update.user_id
+        peer = uid
         first_name = None
         try:
+            # Resolving now also caches the access hash from the live update,
+            # so the DM below can actually reach the user.
             entity = await bot.get_entity(uid)
+            peer = entity
             first_name = getattr(entity, "first_name", None)
         except Exception:
             pass
 
         audience.add(uid)
-        status = await welcome(uid, first_name)
+        status = await welcome(peer, first_name)
         print(f"join request from {uid} -> {status}")
 
     # --- 2. Owner: /start ---------------------------------------------------
@@ -88,14 +100,16 @@ def build_bot() -> TelegramClient:
             return
         await event.reply(
             "Owner panel\n\n"
-            "/setpost    — reply to a post to save it (this is what gets sent)\n"
-            "/clearpost  — forget the saved post\n"
-            "/preview    — send the saved post to yourself\n"
-            "/broadcast  — push the saved post (or a replied post) to everyone\n"
-            "/stats      — audience size + post status\n"
-            "/cancel     — stop a running broadcast\n\n"
-            "The post can be a video/photo/text with premium emoji — everything "
-            "in it is sent as-is."
+            "/setpost     — reply to a post to save it (this is what gets sent)\n"
+            "/clearpost   — forget the saved post\n"
+            "/setbutton   — set inline URL buttons for the post\n"
+            "/clearbutton — remove the buttons\n"
+            "/preview     — send the saved post to yourself\n"
+            "/broadcast   — push the saved post (or a replied post) to everyone\n"
+            "/stats       — audience size + post/button status\n"
+            "/cancel      — stop a running broadcast\n\n"
+            "The post can be a video/photo/text with premium emoji or a spoiler "
+            "image — everything in it is sent as-is."
         )
 
     # --- 2. Owner: /setpost -------------------------------------------------
@@ -118,6 +132,40 @@ def build_bot() -> TelegramClient:
         removed = saved_post.clear()
         await event.reply("Saved post cleared." if removed else "No saved post to clear.")
 
+    # --- 2. Owner: /setbutton -----------------------------------------------
+    @bot.on(events.NewMessage(pattern=r"^/setbutton"))
+    async def on_setbutton(event):
+        if not _is_owner(event):
+            return
+        body = event.raw_text[len("/setbutton"):].strip()
+        if not body:
+            await event.reply(
+                "Set inline buttons for the post.\n\n"
+                "One button:\n/setbutton Join - https://t.me/yourchannel\n\n"
+                "Multiple (| = same row, new line = new row):\n"
+                "/setbutton\n"
+                "Join - https://t.me/x | Chat - https://t.me/y\n"
+                "Website - https://example.com"
+            )
+            return
+        rows, err = buttons.parse(body)
+        if err:
+            await event.reply(err)
+            return
+        buttons.save(rows)
+        total = sum(len(r) for r in rows)
+        await event.reply(
+            f"Saved {total} button(s) in {len(rows)} row(s). Use /preview to check."
+        )
+
+    # --- 2. Owner: /clearbutton ---------------------------------------------
+    @bot.on(events.NewMessage(pattern=r"^/clearbutton"))
+    async def on_clearbutton(event):
+        if not _is_owner(event):
+            return
+        removed = buttons.clear()
+        await event.reply("Buttons cleared." if removed else "No buttons set.")
+
     # --- 2. Owner: /preview -------------------------------------------------
     @bot.on(events.NewMessage(pattern=r"^/preview"))
     async def on_preview(event):
@@ -138,9 +186,11 @@ def build_bot() -> TelegramClient:
             return
         count = len(broadcast_targets())
         post = "set" if saved_post.exists() else "none"
+        btns = buttons.count()
         running = "yes" if _state.running else "no"
         await event.reply(
-            f"Audience: {count}\nSaved post: {post}\nBroadcast running: {running}"
+            f"Audience: {count}\nSaved post: {post}\nButtons: {btns}\n"
+            f"Broadcast running: {running}"
         )
 
     # --- 2. Owner: /cancel --------------------------------------------------

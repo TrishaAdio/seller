@@ -49,6 +49,8 @@ FAILED_FILE = DATA_DIR / "failed.json"
 AUDIENCE_FILE = DATA_DIR / "audience.json"
 # Reference to the owner's saved post (the thing that gets broadcast).
 SAVED_POST_FILE = DATA_DIR / "saved_post.json"
+# Inline URL buttons attached to the post / broadcast (set via /setbutton).
+BUTTONS_FILE = DATA_DIR / "buttons.json"
 
 # Session file names (created on first login).
 USERBOT_SESSION = str(BASE_DIR / "userbot")

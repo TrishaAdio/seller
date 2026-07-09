@@ -13,7 +13,7 @@ from __future__ import annotations
 
 import asyncio
 
-from telethon import TelegramClient
+from telethon import TelegramClient, utils
 from telethon.errors import (
     FloodWaitError,
     InputUserDeactivatedError,
@@ -24,8 +24,33 @@ from telethon.errors import (
 )
 from telethon.tl.types import InputPeerUser, Message, MessageMediaWebPage
 
+import buttons as buttons_store
 import config
 import saved_post
+
+# Non-premium bots can attach at most this many UTF-16 units as a media caption.
+# Longer text is sent as a separate follow-up so nothing (e.g. URLs) is dropped.
+CAPTION_LIMIT = 1024
+
+
+def _utf16_len(text: str) -> int:
+    """Telegram counts caption length in UTF-16 code units, not code points."""
+    return len(text.encode("utf-16-le")) // 2
+
+
+async def _resolve_send_peer(bot: TelegramClient, target):
+    """Turn a target into a sendable peer.
+
+    If it's already an entity/InputPeer, use it. If it's a user id, resolve the
+    real access hash from Telethon's cache (populated by the join-request update
+    or a prior lookup); only fall back to access_hash 0 if that fails.
+    """
+    if not isinstance(target, int):
+        return target
+    try:
+        return await bot.get_input_entity(target)
+    except (ValueError, TypeError):
+        return InputPeerUser(target, 0)
 
 
 async def resolve_saved(bot: TelegramClient) -> Message | None:
@@ -48,26 +73,56 @@ class BroadcastState:
         self.cancel = False
 
 
-async def _copy_to(bot: TelegramClient, user_id: int, src: Message) -> str:
-    """Send a copy of `src` to one user. Returns a status string."""
-    peer = InputPeerUser(user_id, 0)
+async def _copy_to(bot: TelegramClient, target, src: Message, markup="__default__") -> str:
+    """Send a copy of `src` to one target (user id or entity).
+
+    Preserves media, caption, all formatting (incl. premium/custom emoji), and
+    the spoiler flag. If the caption is too long for the bot's media-caption
+    limit, the media is sent first and the full text follows as its own message
+    so no URLs/text are lost. `markup` defaults to the configured /setbutton
+    buttons; pass None to force no buttons.
+    """
+    if markup == "__default__":
+        markup = buttons_store.to_markup()
+
+    peer = await _resolve_send_peer(bot, target)
     entities = src.entities or None
     text = src.message or ""
     try:
         has_media = src.media is not None and not isinstance(src.media, MessageMediaWebPage)
         if has_media:
-            await bot.send_file(
-                peer,
-                file=src.media,
-                caption=text,
-                formatting_entities=entities,
-            )
+            # Re-send existing media by reference (no re-upload) and carry over
+            # the spoiler flag — send_file has no spoiler kwarg in this build,
+            # so we set it on the InputMedia directly.
+            input_media = utils.get_input_media(src.media)
+            if getattr(src.media, "spoiler", False) and hasattr(input_media, "spoiler"):
+                input_media.spoiler = True
+            if _utf16_len(text) <= CAPTION_LIMIT:
+                await bot.send_file(
+                    peer,
+                    input_media,
+                    caption=text,
+                    formatting_entities=entities,
+                    buttons=markup,
+                )
+            else:
+                # Caption exceeds the bot caption limit — send media, then the
+                # full text (with all links) as a separate message.
+                await bot.send_file(peer, input_media, caption="")
+                await bot.send_message(
+                    peer,
+                    text,
+                    formatting_entities=entities,
+                    link_preview=True,
+                    buttons=markup,
+                )
         else:
             await bot.send_message(
                 peer,
                 text,
                 formatting_entities=entities,
                 link_preview=isinstance(src.media, MessageMediaWebPage),
+                buttons=markup,
             )
         return "sent"
     except FloodWaitError as e:
@@ -115,19 +170,20 @@ async def run_broadcast(
     state.cancel = False
     stats = _new_stats(len(targets))
     done = 0
+    markup = buttons_store.to_markup()  # resolve once for the whole run
     try:
         for user_id in targets:
             if state.cancel:
                 break
 
-            status = await _copy_to(bot, user_id, src)
+            status = await _copy_to(bot, user_id, src, markup=markup)
 
             # Wait out short flood requests once, then retry the same user.
             if status.startswith("flood:"):
                 wait = int(status.split(":", 1)[1])
                 if wait <= 300:
                     await asyncio.sleep(wait + 1)
-                    status = await _copy_to(bot, user_id, src)
+                    status = await _copy_to(bot, user_id, src, markup=markup)
 
             if status == "sent":
                 stats["sent"] += 1
