@@ -12,6 +12,7 @@ so we simply pass the original entities straight through.
 from __future__ import annotations
 
 import asyncio
+import json
 
 from telethon import TelegramClient, utils
 from telethon.errors import (
@@ -38,19 +39,39 @@ def _utf16_len(text: str) -> int:
     return len(text.encode("utf-16-le")) // 2
 
 
-async def _resolve_send_peer(bot: TelegramClient, target):
-    """Turn a target into a sendable peer.
+def pending_username_map() -> dict:
+    """Map of user_id -> @username from the fetched backlog (usernames only)."""
+    if not config.PENDING_FILE.exists():
+        return {}
+    try:
+        data = json.loads(config.PENDING_FILE.read_text())
+        return {u["user_id"]: u["username"] for u in data if u.get("username")}
+    except Exception:
+        return {}
 
-    If it's already an entity/InputPeer, use it. If it's a user id, resolve the
-    real access hash from Telethon's cache (populated by the join-request update
-    or a prior lookup); only fall back to access_hash 0 if that fails.
+
+async def _resolve_send_peer(bot: TelegramClient, target, username: str | None = None):
+    """Turn a target into a sendable peer, trying hardest to get a REAL peer.
+
+    Order:
+      1) already an entity/InputPeer -> use as-is
+      2) cached access hash (live join requesters, seen via update)
+      3) resolve the public @username (the only way to reach an OLD requester
+         the bot never saw — works only if the user has a username)
+      4) last resort access_hash 0 (usually rejected for uncached users)
     """
     if not isinstance(target, int):
         return target
     try:
         return await bot.get_input_entity(target)
     except (ValueError, TypeError):
-        return InputPeerUser(target, 0)
+        pass
+    if username:
+        try:
+            return await bot.get_input_entity(username)
+        except Exception:
+            pass
+    return InputPeerUser(target, 0)
 
 
 async def resolve_saved(bot: TelegramClient) -> Message | None:
@@ -73,19 +94,21 @@ class BroadcastState:
         self.cancel = False
 
 
-async def _copy_to(bot: TelegramClient, target, src: Message, markup="__default__") -> str:
+async def _copy_to(bot: TelegramClient, target, src: Message, markup="__default__",
+                   username: str | None = None) -> str:
     """Send a copy of `src` to one target (user id or entity).
 
     Preserves media, caption, all formatting (incl. premium/custom emoji), and
     the spoiler flag. If the caption is too long for the bot's media-caption
     limit, the media is sent first and the full text follows as its own message
     so no URLs/text are lost. `markup` defaults to the configured /setbutton
-    buttons; pass None to force no buttons.
+    buttons; pass None to force no buttons. `username` lets old requesters be
+    resolved by @username when the bot has no cached access hash.
     """
     if markup == "__default__":
         markup = buttons_store.to_markup()
 
-    peer = await _resolve_send_peer(bot, target)
+    peer = await _resolve_send_peer(bot, target, username)
     entities = src.entities or None
     text = src.message or ""
     try:
@@ -160,30 +183,36 @@ async def run_broadcast(
     targets: list[int],
     state: BroadcastState,
     progress=None,
+    usernames: dict | None = None,
 ) -> dict:
     """Copy `src` to every id in `targets`, paced and cancellable.
 
     `progress` (optional) is an async callable(done, stats) invoked periodically.
-    Returns a stats dict. Stops early on PeerFloodError (hard rate limit).
+    `usernames` (optional) maps user_id -> @username so old requesters the bot
+    never saw can still be resolved. Returns a stats dict. Stops early on
+    PeerFloodError (hard rate limit).
     """
     state.running = True
     state.cancel = False
     stats = _new_stats(len(targets))
     done = 0
     markup = buttons_store.to_markup()  # resolve once for the whole run
+    if usernames is None:
+        usernames = pending_username_map()
     try:
         for user_id in targets:
             if state.cancel:
                 break
 
-            status = await _copy_to(bot, user_id, src, markup=markup)
+            uname = usernames.get(user_id)
+            status = await _copy_to(bot, user_id, src, markup=markup, username=uname)
 
             # Wait out short flood requests once, then retry the same user.
             if status.startswith("flood:"):
                 wait = int(status.split(":", 1)[1])
                 if wait <= 300:
                     await asyncio.sleep(wait + 1)
-                    status = await _copy_to(bot, user_id, src, markup=markup)
+                    status = await _copy_to(bot, user_id, src, markup=markup, username=uname)
 
             if status == "sent":
                 stats["sent"] += 1

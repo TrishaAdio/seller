@@ -29,21 +29,28 @@ def build_bot() -> TelegramClient:
     return TelegramClient(config.BOT_SESSION, config.API_ID, config.API_HASH)
 
 
-async def _resolve_peer(bot: TelegramClient, user_id: int):
-    """Real access hash from cache if known, else access_hash 0 as a fallback."""
+async def _resolve_peer(bot: TelegramClient, user_id: int, username: str | None = None):
+    """Real peer: cached hash, then @username lookup, then access_hash 0."""
     try:
         return await bot.get_input_entity(user_id)
     except (ValueError, TypeError):
-        return InputPeerUser(user_id, 0)
+        pass
+    if username:
+        try:
+            return await bot.get_input_entity(username)
+        except Exception:
+            pass
+    return InputPeerUser(user_id, 0)
 
 
-async def dm_user(bot: TelegramClient, user_id: int, first_name: str | None) -> str:
+async def dm_user(bot: TelegramClient, user_id: int, first_name: str | None,
+                  username: str | None = None) -> str:
     """Send the fallback text DM to one user.
 
     Returns a status string: "sent", "blocked", "invalid", "deleted",
     "is_bot", or "flood:<seconds>". Raises nothing for expected failures.
     """
-    peer = await _resolve_peer(bot, user_id)
+    peer = await _resolve_peer(bot, user_id, username)
     text = config.render_message(first_name)
     try:
         await bot.send_message(peer, text, link_preview=False,
@@ -66,11 +73,12 @@ async def dm_user(bot: TelegramClient, user_id: int, first_name: str | None) -> 
 
 
 async def dm_user_with_flood_retry(
-    bot: TelegramClient, user_id: int, first_name: str | None, max_wait: int = 300
+    bot: TelegramClient, user_id: int, first_name: str | None, max_wait: int = 300,
+    username: str | None = None,
 ) -> str:
     """Same as dm_user but transparently waits out short FloodWaitErrors."""
     while True:
-        status = await dm_user(bot, user_id, first_name)
+        status = await dm_user(bot, user_id, first_name, username)
         if status.startswith("flood:"):
             wait = int(status.split(":", 1)[1])
             if wait > max_wait:

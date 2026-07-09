@@ -35,7 +35,14 @@ async def main() -> None:
     failed = _load(config.FAILED_FILE, {})
 
     todo = [u for u in pending if u["user_id"] not in sent]
-    print(f"{len(pending)} total, {len(sent)} already done, {len(todo)} to go.\n")
+    with_username = sum(1 for u in todo if u.get("username"))
+    print(f"{len(pending)} total, {len(sent)} already done, {len(todo)} to go.")
+    print(
+        f"Of those to go: {with_username} have a public @username (the bot can "
+        f"reach these), {len(todo) - with_username} have none.\n"
+        "Note: old requesters WITHOUT a username usually can't be DMed by a bot "
+        "(Telegram limitation) and will show as [invalid].\n"
+    )
 
     bot = build_bot()
     await bot.start(bot_token=config.BOT_TOKEN)
@@ -58,15 +65,17 @@ async def main() -> None:
     try:
         for user in todo:
             uid = user["user_id"]
+            uname = user.get("username")
             if src is not None:
-                status = await broadcast._copy_to(bot, uid, src)
+                status = await broadcast._copy_to(bot, uid, src, username=uname)
                 if status.startswith("flood:"):
                     wait = int(status.split(":", 1)[1])
                     if wait <= 300:
                         await asyncio.sleep(wait + 1)
-                        status = await broadcast._copy_to(bot, uid, src)
+                        status = await broadcast._copy_to(bot, uid, src, username=uname)
             else:
-                status = await dm_user_with_flood_retry(bot, uid, user.get("first_name"))
+                status = await dm_user_with_flood_retry(
+                    bot, uid, user.get("first_name"), username=uname)
 
             if status == "sent":
                 sent.add(uid)
