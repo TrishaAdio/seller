@@ -15,6 +15,7 @@ import asyncio
 import json
 
 from telethon import TelegramClient
+from telethon.errors import ChatAdminRequiredError
 from telethon.tl.functions.messages import GetChatInviteImportersRequest
 from telethon.tl.types import InputUserEmpty
 
@@ -22,6 +23,32 @@ import audience
 import config
 
 PAGE = 100  # max the API returns per call
+
+
+async def resolve_channel(client: TelegramClient, ident):
+    """Resolve the source channel, even a PRIVATE one referenced by numeric id.
+
+    Telethon can't look up a private channel by bare id unless it's already in
+    the account's entity cache. So if the direct lookup fails, we warm the cache
+    by loading the account's dialogs (the channel you admin is in there) and
+    retry.
+    """
+    try:
+        return await client.get_entity(ident)
+    except (ValueError, TypeError):
+        pass
+
+    print("Channel not cached yet — loading your dialogs to find it...")
+    target = None
+    async for dialog in client.iter_dialogs():
+        if dialog.id == ident or getattr(dialog.entity, "id", None) == ident:
+            target = dialog.entity
+            break
+
+    if target is not None:
+        return target
+    # One more direct attempt now that the cache is warm.
+    return await client.get_entity(ident)
 
 
 async def fetch_all_pending() -> list[dict]:
@@ -33,7 +60,18 @@ async def fetch_all_pending() -> list[dict]:
     me = await client.get_me()
     print(f"Logged in as {me.first_name} (id {me.id})")
 
-    channel = await client.get_entity(config.SOURCE_CHANNEL)
+    try:
+        channel = await resolve_channel(client, config.channel_ident())
+    except (ValueError, TypeError):
+        await client.disconnect()
+        raise SystemExit(
+            f"Could not find the channel {config.SOURCE_CHANNEL!r}.\n"
+            "Check that:\n"
+            "  - SOURCE_CHANNEL in .env is correct (id like -100..., @username, "
+            "or invite link)\n"
+            f"  - this account ({me.first_name}, id {me.id}) is a MEMBER/ADMIN "
+            "of that channel."
+        )
     print(f"Reading pending join requests for: {getattr(channel, 'title', channel.id)}")
 
     importers: list[dict] = []
@@ -41,15 +79,22 @@ async def fetch_all_pending() -> list[dict]:
     offset_user = InputUserEmpty()
 
     while True:
-        result = await client(
-            GetChatInviteImportersRequest(
-                peer=channel,
-                limit=PAGE,
-                offset_date=offset_date,
-                offset_user=offset_user,
-                requested=True,  # only users with a *pending* join request
+        try:
+            result = await client(
+                GetChatInviteImportersRequest(
+                    peer=channel,
+                    limit=PAGE,
+                    offset_date=offset_date,
+                    offset_user=offset_user,
+                    requested=True,  # only users with a *pending* join request
+                )
             )
-        )
+        except ChatAdminRequiredError:
+            await client.disconnect()
+            raise SystemExit(
+                f"This account ({me.first_name}) must be an ADMIN of the channel "
+                "with the 'Add users' right to read join requests."
+            )
         if not result.importers:
             break
 

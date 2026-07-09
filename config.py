@@ -55,6 +55,17 @@ USERBOT_SESSION = str(BASE_DIR / "userbot")
 BOT_SESSION = str(BASE_DIR / "bot")
 
 
+def channel_ident():
+    """SOURCE_CHANNEL as an int id when numeric (e.g. -1004363487750), else the
+    raw string (username / invite link). Passing an int makes Telethon treat it
+    as a peer id instead of trying to resolve it as a username."""
+    s = SOURCE_CHANNEL.strip()
+    if not s:
+        return s
+    body = s[1:] if s.startswith("-") else s
+    return int(s) if body.isdigit() else s
+
+
 def has_text_template() -> bool:
     """True if a fallback DM text template is configured."""
     return bool(DM_MESSAGE.strip())
