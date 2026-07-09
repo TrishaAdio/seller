@@ -75,6 +75,7 @@ async def fetch_all_pending() -> list[dict]:
     print(f"Reading pending join requests for: {getattr(channel, 'title', channel.id)}")
 
     importers: list[dict] = []
+    seen: set[int] = set()
     offset_date = None
     offset_user = InputUserEmpty()
 
@@ -95,11 +96,20 @@ async def fetch_all_pending() -> list[dict]:
                 f"This account ({me.first_name}) must be an ADMIN of the channel "
                 "with the 'Add users' right to read join requests."
             )
+
+        # Telegram returns an empty page only when there's nothing left. It may
+        # return FEWER than `limit` while more still remain, so we must NOT stop
+        # just because a page was short.
         if not result.importers:
             break
 
         users_by_id = {u.id: u for u in result.users}
+        new_count = 0
         for imp in result.importers:
+            if imp.user_id in seen:
+                continue
+            seen.add(imp.user_id)
+            new_count += 1
             u = users_by_id.get(imp.user_id)
             importers.append(
                 {
@@ -112,12 +122,16 @@ async def fetch_all_pending() -> list[dict]:
 
         print(f"  ...collected {len(importers)} so far")
 
+        # If a full page brought nothing new, the offset isn't advancing —
+        # stop rather than loop forever.
+        if new_count == 0:
+            break
+
         last = result.importers[-1]
         offset_date = last.date
         offset_user = await client.get_input_entity(users_by_id[last.user_id])
 
-        if len(result.importers) < PAGE:
-            break
+        await asyncio.sleep(0.5)  # be gentle between pages
 
     await client.disconnect()
     return importers
