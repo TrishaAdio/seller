@@ -25,6 +25,19 @@ from telethon.errors import (
 from telethon.tl.types import InputPeerUser, Message, MessageMediaWebPage
 
 import config
+import saved_post
+
+
+async def resolve_saved(bot: TelegramClient) -> Message | None:
+    """Fetch the owner's saved-post Message, or None if unset/deleted."""
+    info = saved_post.load()
+    if not info:
+        return None
+    try:
+        msg = await bot.get_messages(info["chat_id"], ids=info["message_id"])
+    except Exception:
+        return None
+    return msg  # None if the message was deleted
 
 
 class BroadcastState:

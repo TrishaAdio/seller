@@ -61,10 +61,16 @@ async def main() -> None:
     api_hash = ask("API_HASH", secret=True)
     bot_token = ask("BOT_TOKEN", secret=True)
     source_channel = ask("SOURCE_CHANNEL (@username or -100... id)")
-    new_channel_link = ask("NEW_CHANNEL_LINK (invite link to your new channel)")
+
+    print(
+        "\nContent is set later by DMing the bot and replying to your post with"
+        "\n/setpost — so the next two are OPTIONAL text fallbacks. Press Enter to"
+        "\nskip them and just use a saved post."
+    )
+    new_channel_link = ask("NEW_CHANNEL_LINK (optional)", default="")
     dm_message = ask(
-        "DM_MESSAGE (use {name} and {link})",
-        default="Hey {name}! We've moved — join our new channel: {link}",
+        "DM_MESSAGE fallback (optional, use {name} and {link})",
+        default="",
     )
 
     print("\nRate limiting (press Enter to accept defaults):")
@@ -114,9 +120,11 @@ async def main() -> None:
     )
 
     print("\nAll set. Next steps:")
-    print("  1) python fetch_pending.py   # userbot lists the join-request backlog")
-    print("  2) python dm_backlog.py      # bot DMs them the invite")
-    print("  3) python live_bot.py        # keep running: auto-DM new joiners + /broadcast")
+    print("  1) python live_bot.py        # start the bot, then DM it /setpost")
+    print("     (reply to your post with /setpost to save what gets sent)")
+    print("  2) python fetch_pending.py   # userbot lists the join-request backlog")
+    print("  3) python dm_backlog.py      # bot sends the saved post to the backlog")
+    print("  Keep live_bot.py running: it auto-welcomes new joiners and serves /broadcast.")
     print("\nMake sure the BOT is an ADMIN of the source channel (with 'Add users'),")
     print("and that your own account is an admin there too.")
 

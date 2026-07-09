@@ -1,17 +1,24 @@
 """The BOT (long-running). Two jobs:
 
-1. Auto-DM every NEW join requester the invite to your new channel, the instant
-   they request to join. This is the "flawless" path — the bot sees the request
-   live so it can always reach the user. Each requester is also added to the
-   broadcast audience.
+1. Welcome every NEW join requester automatically the instant they request to
+   join — by sending them your SAVED POST (see /setpost). This is the "flawless"
+   path: the bot sees the request live, so it can always reach the user. Each
+   requester is also added to the broadcast audience.
 
-2. Let the OWNER post to everyone with /broadcast (reply to any message).
+2. Let the OWNER post to everyone with /broadcast.
+
+The content is ONE saved post you set with /setpost — any message (video,
+photo, text, premium emoji... everything lives in that post). No fixed
+"new channel link" config is required; whatever you put in the post is what
+gets sent.
 
 Owner commands (DM the bot):
   /start              show help
-  /stats              show audience size + broadcast state
-  /broadcast          reply to a post to send it to the whole audience
-                      (any format: video, photo, text... premium emoji kept)
+  /setpost            reply to a message to save it as THE post
+  /clearpost          forget the saved post
+  /preview            send the saved post to yourself
+  /stats              audience size + whether a post is set
+  /broadcast          push the saved post (or a replied post) to everyone
   /cancel             stop a running broadcast
 
 Requirements:
@@ -26,25 +33,40 @@ from __future__ import annotations
 import asyncio
 
 from telethon import TelegramClient, events
-from telethon.tl.types import UpdateBotChatInviteRequester
+from telethon.tl.types import InputPeerUser, UpdateBotChatInviteRequester
 
 import audience
 import broadcast
 import config
+import saved_post
 from bot_dm import dm_user
 
 _state = broadcast.BroadcastState()
 
 
 def _is_owner(event) -> bool:
-    return config.OWNER_ID and event.sender_id == config.OWNER_ID
+    return bool(config.OWNER_ID) and event.sender_id == config.OWNER_ID
+
+
+def broadcast_targets() -> list[int]:
+    """Everyone we can post to: saved audience unioned with the pending dump."""
+    return audience.merged_with_pending()
 
 
 def build_bot() -> TelegramClient:
     config.require("API_ID", "API_HASH", "BOT_TOKEN")
     bot = TelegramClient(config.BOT_SESSION, config.API_ID, config.API_HASH)
 
-    # --- 1. New join requests -> auto-DM + remember for broadcasts ---------
+    async def welcome(user_id: int, first_name: str | None) -> str:
+        """Send the saved post to one user; fall back to the text template."""
+        src = await broadcast.resolve_saved(bot)
+        if src is not None:
+            return await broadcast._copy_to(bot, user_id, src)
+        if config.has_text_template():
+            return await dm_user(bot, user_id, first_name)
+        return "no_post"  # nothing configured yet — just collected
+
+    # --- 1. New join requests -> auto-welcome + remember for broadcasts ----
     @bot.on(events.Raw(UpdateBotChatInviteRequester))
     async def on_request(update: UpdateBotChatInviteRequester):
         uid = update.user_id
@@ -56,8 +78,8 @@ def build_bot() -> TelegramClient:
             pass
 
         audience.add(uid)
-        status = await dm_user(bot, uid, first_name)
-        print(f"join request from {uid} -> DM {status}")
+        status = await welcome(uid, first_name)
+        print(f"join request from {uid} -> {status}")
 
     # --- 2. Owner: /start ---------------------------------------------------
     @bot.on(events.NewMessage(pattern=r"^/start"))
@@ -66,11 +88,48 @@ def build_bot() -> TelegramClient:
             return
         await event.reply(
             "Owner panel\n\n"
-            "/broadcast  — reply to any post to send it to everyone\n"
-            "/stats      — audience size + status\n"
+            "/setpost    — reply to a post to save it (this is what gets sent)\n"
+            "/clearpost  — forget the saved post\n"
+            "/preview    — send the saved post to yourself\n"
+            "/broadcast  — push the saved post (or a replied post) to everyone\n"
+            "/stats      — audience size + post status\n"
             "/cancel     — stop a running broadcast\n\n"
-            "Tip: reply to a video/photo/text (premium emoji supported)."
+            "The post can be a video/photo/text with premium emoji — everything "
+            "in it is sent as-is."
         )
+
+    # --- 2. Owner: /setpost -------------------------------------------------
+    @bot.on(events.NewMessage(pattern=r"^/setpost"))
+    async def on_setpost(event):
+        if not _is_owner(event):
+            return
+        src = await event.get_reply_message()
+        if src is None:
+            await event.reply("Reply to the message you want to save with /setpost.")
+            return
+        saved_post.save(event.chat_id, src.id)
+        await event.reply("Saved. This post will be sent to new joiners and on /broadcast.")
+
+    # --- 2. Owner: /clearpost -----------------------------------------------
+    @bot.on(events.NewMessage(pattern=r"^/clearpost"))
+    async def on_clearpost(event):
+        if not _is_owner(event):
+            return
+        removed = saved_post.clear()
+        await event.reply("Saved post cleared." if removed else "No saved post to clear.")
+
+    # --- 2. Owner: /preview -------------------------------------------------
+    @bot.on(events.NewMessage(pattern=r"^/preview"))
+    async def on_preview(event):
+        if not _is_owner(event):
+            return
+        src = await broadcast.resolve_saved(bot)
+        if src is None:
+            await event.reply("No saved post. Use /setpost (reply to a message) first.")
+            return
+        status = await broadcast._copy_to(bot, event.sender_id, src)
+        if status != "sent":
+            await event.reply(f"Preview failed: {status}")
 
     # --- 2. Owner: /stats ---------------------------------------------------
     @bot.on(events.NewMessage(pattern=r"^/stats"))
@@ -78,8 +137,11 @@ def build_bot() -> TelegramClient:
         if not _is_owner(event):
             return
         count = len(broadcast_targets())
+        post = "set" if saved_post.exists() else "none"
         running = "yes" if _state.running else "no"
-        await event.reply(f"Audience: {count}\nBroadcast running: {running}")
+        await event.reply(
+            f"Audience: {count}\nSaved post: {post}\nBroadcast running: {running}"
+        )
 
     # --- 2. Owner: /cancel --------------------------------------------------
     @bot.on(events.NewMessage(pattern=r"^/cancel"))
@@ -101,11 +163,14 @@ def build_bot() -> TelegramClient:
             await event.reply("A broadcast is already running. Use /cancel first.")
             return
 
+        # Prefer a replied post; otherwise use the saved post.
         src = await event.get_reply_message()
         if src is None:
+            src = await broadcast.resolve_saved(bot)
+        if src is None:
             await event.reply(
-                "Reply to the post you want to send (video, photo, text...) "
-                "with /broadcast."
+                "Nothing to send. Reply to a post with /broadcast, or set one "
+                "with /setpost first."
             )
             return
 
@@ -143,22 +208,18 @@ def build_bot() -> TelegramClient:
     return bot
 
 
-def broadcast_targets() -> list[int]:
-    """Everyone we can post to: saved audience unioned with the pending dump."""
-    return audience.merged_with_pending()
-
-
 async def main() -> None:
-    config.require("API_ID", "API_HASH", "BOT_TOKEN", "NEW_CHANNEL_LINK")
+    config.require("API_ID", "API_HASH", "BOT_TOKEN")
     if not config.OWNER_ID:
-        print("WARNING: OWNER_ID is not set — /broadcast will be disabled. "
+        print("WARNING: OWNER_ID is not set — owner commands are disabled. "
               "Run `python setup.py` or set OWNER_ID in .env.")
 
     bot = build_bot()
     await bot.start(bot_token=config.BOT_TOKEN)
     me = await bot.get_me()
-    print(f"Live as @{me.username}. Waiting for join requests on "
-          f"{config.SOURCE_CHANNEL} ... (Ctrl+C to stop)")
+    post = "set" if saved_post.exists() else "NOT set (use /setpost)"
+    print(f"Live as @{me.username}. Saved post: {post}.")
+    print(f"Waiting for join requests on {config.SOURCE_CHANNEL} ... (Ctrl+C to stop)")
     await bot.run_until_disconnected()
 
 

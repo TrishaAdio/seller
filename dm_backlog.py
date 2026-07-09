@@ -9,6 +9,7 @@ On first run the bot logs in from its token (no phone code needed).
 import asyncio
 import json
 
+import broadcast
 import config
 from bot_dm import build_bot, dm_user_with_flood_retry
 
@@ -28,7 +29,6 @@ async def main() -> None:
         raise SystemExit(
             f"{config.PENDING_FILE} not found. Run `python fetch_pending.py` first."
         )
-    config.require("NEW_CHANNEL_LINK")
 
     pending = _load(config.PENDING_FILE, [])
     sent = set(_load(config.SENT_FILE, []))
@@ -40,11 +40,33 @@ async def main() -> None:
     bot = build_bot()
     await bot.start(bot_token=config.BOT_TOKEN)
 
+    # Prefer the saved post (set via the bot with /setpost); else the text
+    # template from .env. Fail early if neither is available.
+    src = await broadcast.resolve_saved(bot)
+    if src is not None:
+        print("Sending the SAVED POST to the backlog.\n")
+    elif config.has_text_template():
+        print("No saved post; using the DM_MESSAGE text template.\n")
+    else:
+        await bot.disconnect()
+        raise SystemExit(
+            "Nothing to send. Set a post first: DM the bot, reply to your post "
+            "with /setpost (run live_bot.py), or set DM_MESSAGE in .env."
+        )
+
     processed = 0
     try:
         for user in todo:
             uid = user["user_id"]
-            status = await dm_user_with_flood_retry(bot, uid, user.get("first_name"))
+            if src is not None:
+                status = await broadcast._copy_to(bot, uid, src)
+                if status.startswith("flood:"):
+                    wait = int(status.split(":", 1)[1])
+                    if wait <= 300:
+                        await asyncio.sleep(wait + 1)
+                        status = await broadcast._copy_to(bot, uid, src)
+            else:
+                status = await dm_user_with_flood_retry(bot, uid, user.get("first_name"))
 
             if status == "sent":
                 sent.add(uid)

@@ -22,9 +22,14 @@ OWNER_ID = int(os.getenv("OWNER_ID", "0"))
 
 # --- Channel + message ----------------------------------------------------
 SOURCE_CHANNEL = os.getenv("SOURCE_CHANNEL", "")
+
+# NEW_CHANNEL_LINK and DM_MESSAGE are OPTIONAL. The primary content is the
+# "saved post" the owner sets with /setpost (any message: video/photo/text,
+# premium emoji — everything lives in that post). These two are only used as a
+# fallback text template when NO saved post exists.
 NEW_CHANNEL_LINK = os.getenv("NEW_CHANNEL_LINK", "")
 # \n in the .env is literal; turn it into a real newline.
-DM_MESSAGE = os.getenv("DM_MESSAGE", "Join our new channel: {link}").replace("\\n", "\n")
+DM_MESSAGE = os.getenv("DM_MESSAGE", "").replace("\\n", "\n")
 
 # --- Rate limiting --------------------------------------------------------
 DM_DELAY_SECONDS = float(os.getenv("DM_DELAY_SECONDS", "4"))
@@ -42,14 +47,21 @@ SENT_FILE = DATA_DIR / "sent.json"
 FAILED_FILE = DATA_DIR / "failed.json"
 # Accumulated set of everyone we can broadcast to (requesters, live joiners).
 AUDIENCE_FILE = DATA_DIR / "audience.json"
+# Reference to the owner's saved post (the thing that gets broadcast).
+SAVED_POST_FILE = DATA_DIR / "saved_post.json"
 
 # Session file names (created on first login).
 USERBOT_SESSION = str(BASE_DIR / "userbot")
 BOT_SESSION = str(BASE_DIR / "bot")
 
 
+def has_text_template() -> bool:
+    """True if a fallback DM text template is configured."""
+    return bool(DM_MESSAGE.strip())
+
+
 def render_message(first_name: str | None) -> str:
-    """Fill the DM template with the user's name and the invite link."""
+    """Fill the fallback DM template with the user's name and the invite link."""
     name = (first_name or "there").strip() or "there"
     return DM_MESSAGE.format(name=name, link=NEW_CHANNEL_LINK)
 
