@@ -16,6 +16,7 @@ import json
 
 from telethon import TelegramClient, utils
 from telethon.errors import (
+    FileReferenceExpiredError,
     FloodWaitError,
     InputUserDeactivatedError,
     PeerFloodError,
@@ -74,16 +75,92 @@ async def _resolve_send_peer(bot: TelegramClient, target, username: str | None =
     return InputPeerUser(target, 0)
 
 
+async def _warm_saved_peer(bot: TelegramClient, chat_id: int):
+    """Return a sendable peer for the saved post's chat, warming the bot's entity
+    cache when a bare numeric channel id isn't known yet.
+
+    Why this exists: the saved post is stored only as (chat_id, message_id). The
+    chat_id is usually a numeric channel id (-100...). To fetch a message by that
+    id the bot needs the channel's access_hash in its session entity cache. On a
+    FRESH session (new VPS) or after a restart that cache can be cold, so a bare
+    `get_messages(-100..., ...)` raises 'Could not find the input entity'.
+
+    Unlike the userbot, a bot CANNOT warm its cache with iter_dialogs, so we lean
+    on the configured SOURCE_CHANNEL: resolving it (public @username resolves
+    directly; a numeric/invite ident resolves once reachable) populates the cache
+    for that channel id, after which the saved-post fetch succeeds.
+    """
+    # 1) Already cached (from a prior update / interaction)?
+    try:
+        return await bot.get_input_entity(chat_id)
+    except (ValueError, TypeError):
+        pass
+    # 2) Warm via the configured source channel — the saved post normally lives
+    #    in the channel the bot administers.
+    ident = config.channel_ident()
+    if ident:
+        try:
+            ent = await bot.get_entity(ident)
+            if utils.get_peer_id(ent) == chat_id:
+                return ent
+            # Different chat than SOURCE_CHANNEL, but the cache may be warm now.
+            return await bot.get_input_entity(chat_id)
+        except Exception as exc:  # noqa: BLE001
+            print(f"resolve_saved: could not warm channel {ident!r}: "
+                  f"{type(exc).__name__}: {exc}")
+    # 3) Last resort: let get_messages try the raw id again.
+    return chat_id
+
+
 async def resolve_saved(bot: TelegramClient) -> Message | None:
-    """Fetch the owner's saved-post Message, or None if unset/deleted."""
+    """Fetch the owner's saved-post Message, or None if unset/deleted.
+
+    Failures are LOGGED (not silently swallowed) so a genuine problem — cold
+    entity cache, expired file reference, auth — is visible instead of silently
+    degrading to the plain-text fallback and dropping the premium/custom emoji.
+    """
     info = saved_post.load()
     if not info:
         return None
+    chat_id = info["chat_id"]
+    message_id = info["message_id"]
+
+    # First attempt: straight fetch (works whenever the peer is already cached).
     try:
-        msg = await bot.get_messages(info["chat_id"], ids=info["message_id"])
-    except Exception:
+        return await bot.get_messages(chat_id, ids=message_id)
+    except Exception as first_exc:  # noqa: BLE001
+        print(f"resolve_saved: direct fetch of {chat_id}/{message_id} failed "
+              f"({type(first_exc).__name__}: {first_exc}); warming cache and "
+              "retrying...")
+
+    # Second attempt: warm the entity cache, then retry via the resolved peer.
+    try:
+        peer = await _warm_saved_peer(bot, chat_id)
+        return await bot.get_messages(peer, ids=message_id)
+    except Exception as exc:  # noqa: BLE001
+        print(f"resolve_saved: could not fetch saved post {chat_id}/{message_id} "
+              f"after warming: {type(exc).__name__}: {exc}. NOTE: falling back "
+              "means the saved post (and its premium/custom emoji) will NOT be "
+              "sent. Re-run /setpost from this machine, or ensure the bot has "
+              "seen SOURCE_CHANNEL.")
         return None
-    return msg  # None if the message was deleted
+
+
+async def _refresh_message(bot: TelegramClient, src: Message) -> Message:
+    """Re-fetch `src` to obtain a fresh file_reference.
+
+    Telegram file references embedded in a Message expire after some time, so a
+    saved post that worked when first set can later fail to re-send with
+    FileReferenceExpiredError. Re-fetching the same (chat, id) yields a valid
+    reference again. Falls back to the original message if the refetch fails.
+    """
+    try:
+        fresh = await bot.get_messages(src.peer_id, ids=src.id)
+        if fresh is not None:
+            return fresh
+    except Exception as exc:  # noqa: BLE001
+        print(f"refresh saved post failed: {type(exc).__name__}: {exc}")
+    return src
 
 
 class BroadcastState:
@@ -109,16 +186,20 @@ async def _copy_to(bot: TelegramClient, target, src: Message, markup="__default_
         markup = buttons_store.to_markup()
 
     peer = await _resolve_send_peer(bot, target, username)
-    entities = src.entities or None
-    text = src.message or ""
-    try:
-        has_media = src.media is not None and not isinstance(src.media, MessageMediaWebPage)
+
+    async def _send(message: Message) -> None:
+        # entities carry the premium/custom emoji (MessageEntityCustomEmoji) and
+        # all other formatting; we pass them straight through so they survive.
+        entities = message.entities or None
+        text = message.message or ""
+        has_media = message.media is not None and not isinstance(
+            message.media, MessageMediaWebPage)
         if has_media:
             # Re-send existing media by reference (no re-upload) and carry over
             # the spoiler flag — send_file has no spoiler kwarg in this build,
             # so we set it on the InputMedia directly.
-            input_media = utils.get_input_media(src.media)
-            if getattr(src.media, "spoiler", False) and hasattr(input_media, "spoiler"):
+            input_media = utils.get_input_media(message.media)
+            if getattr(message.media, "spoiler", False) and hasattr(input_media, "spoiler"):
                 input_media.spoiler = True
             if _utf16_len(text) <= CAPTION_LIMIT:
                 await bot.send_file(
@@ -144,9 +225,18 @@ async def _copy_to(bot: TelegramClient, target, src: Message, markup="__default_
                 peer,
                 text,
                 formatting_entities=entities,
-                link_preview=isinstance(src.media, MessageMediaWebPage),
+                link_preview=isinstance(message.media, MessageMediaWebPage),
                 buttons=markup,
             )
+
+    try:
+        try:
+            await _send(src)
+        except FileReferenceExpiredError:
+            # The stored media reference went stale (happens after hours/days).
+            # Re-fetch the post for a fresh reference and try once more.
+            print("file reference expired — refreshing saved post and retrying")
+            await _send(await _refresh_message(bot, src))
         return "sent"
     except FloodWaitError as e:
         return f"flood:{e.seconds}"
@@ -234,6 +324,9 @@ async def run_broadcast(
             await asyncio.sleep(config.DM_DELAY_SECONDS)
             if config.BATCH_SIZE and done % config.BATCH_SIZE == 0:
                 await asyncio.sleep(config.BATCH_PAUSE_SECONDS)
+                # A long broadcast can outlive the media's file_reference; grab a
+                # fresh copy each batch so we don't keep hitting expiry per-send.
+                src = await _refresh_message(bot, src)
     finally:
         state.running = False
 

@@ -267,6 +267,22 @@ async def main() -> None:
     bot = build_bot()
     await bot.start(bot_token=config.BOT_TOKEN)
     me = await bot.get_me()
+
+    # Warm the entity cache for the source channel up front. The saved post is
+    # fetched by numeric channel id, which needs the channel's access_hash in
+    # the session cache; on a fresh session (new VPS) or right after a restart
+    # that cache is cold, so the first welcome would otherwise silently fall
+    # back to plain text and drop the post's premium/custom emoji.
+    ident = config.channel_ident()
+    if ident:
+        try:
+            chan = await bot.get_entity(ident)
+            print(f"Source channel resolved: {getattr(chan, 'title', ident)}")
+        except Exception as exc:  # noqa: BLE001
+            print(f"Could not pre-resolve SOURCE_CHANNEL {ident!r} "
+                  f"({type(exc).__name__}: {exc}). It will be warmed from the "
+                  "first join-request update instead.")
+
     post = "set" if saved_post.exists() else "NOT set (use /setpost)"
     print(f"Live as @{me.username}. Saved post: {post}.")
     print(f"Waiting for join requests on {config.SOURCE_CHANNEL} ... (Ctrl+C to stop)")
