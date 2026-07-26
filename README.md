@@ -55,6 +55,18 @@ Finally, DM the bot the post you want to send and **reply to it with
 While no channel is registered the bot handles join requests from **every** chat
 it administers; once one is added, only registered chats are handled.
 
+### Requests from a channel you forgot to add
+
+They are not lost. The bot **holds** every requester it sees in an unregistered
+chat (in memory, up to 5000 per chat) and DMs you once, with the chat id, the
+moment the first one shows up. Running `/add <that id>` registers the channel
+**and** delivers the post to everyone held for it, paced like a broadcast.
+`/stats` shows what's currently held.
+
+This matters because Telegram gives bots no way to list pending join requests
+after the fact — the live update is the only chance to see them, so the bot
+keeps them.
+
 The bot copies the post (no "forwarded from" tag) and edits a live progress
 message as a broadcast runs.
 

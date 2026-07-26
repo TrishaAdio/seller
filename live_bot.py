@@ -50,6 +50,13 @@ import saved_post
 
 _state = broadcast.BroadcastState()
 
+# Requesters seen in chats that were NOT registered at the time, kept per chat so
+# /add can still deliver to them. A bot cannot list pending join requests after
+# the fact, but it did see these updates live — this is the only way back to
+# them. Bounded so a raid on an unwatched chat can't eat memory.
+_skipped: dict[int, dict[int, None]] = {}
+_SKIPPED_MAX = 5000
+
 HELP = (
     "Owner panel\n\n"
     "/add <chat_id>    — watch a channel's join requests\n"
@@ -105,12 +112,78 @@ def build_bot() -> TelegramClient:
             return "no_post"  # nothing configured yet — user just collected
         return await broadcast._copy_to(bot, peer, src)
 
+    async def chat_label(peer, chat_id: int) -> str:
+        """Best-effort '<id> — <title>' for logs and owner notices."""
+        title = dict(channels.all_items()).get(chat_id, "")
+        if not title:
+            try:
+                title = getattr(await bot.get_entity(peer), "title", "") or ""
+            except Exception:
+                title = ""
+        return _fmt_chat(chat_id, title)
+
+    async def notify_unregistered(peer, chat_id: int) -> None:
+        """Tell the owner once that a chat is producing requests it isn't watching."""
+        if not config.OWNER_ID:
+            return
+        try:
+            await bot.send_message(
+                config.OWNER_ID,
+                "Join requests arriving from a chat that is not registered:\n"
+                f"{await chat_label(peer, chat_id)}\n\n"
+                f"/add {chat_id}",
+            )
+        except Exception as exc:  # noqa: BLE001
+            print(f"could not notify owner about {chat_id}: "
+                  f"{type(exc).__name__}: {exc}")
+
+    async def flush_held(chat_id: int, user_ids: list[int], event) -> None:
+        """Deliver to requesters that arrived while `chat_id` wasn't registered.
+
+        Their access hashes were cached when the live update came in (and are
+        persisted in bot.session), so these sends can still land. Paced like a
+        broadcast so a big catch-up doesn't trip a flood limit.
+        """
+        sent = failed = 0
+        for uid in user_ids:
+            peer = uid
+            try:
+                peer = await bot.get_entity(uid)
+            except Exception:
+                pass
+            audience.add(uid)
+            status = await welcome(peer)
+            if status == "sent":
+                sent += 1
+            else:
+                failed += 1
+                print(f"catch-up to {uid} ({chat_id}) -> {status}")
+            await asyncio.sleep(config.DM_DELAY_SECONDS)
+        print(f"catch-up for {chat_id}: sent {sent}, failed {failed}")
+        try:
+            await event.reply(
+                f"Catch-up for {chat_id} done. Sent {sent}/{len(user_ids)}"
+                + (f", failed {failed}" if failed else "")
+            )
+        except Exception:
+            pass
+
     # --- 1. New join requests -> auto-welcome + remember for broadcasts ----
     @bot.on(events.Raw(UpdateBotChatInviteRequester))
     async def on_request(update: UpdateBotChatInviteRequester):
         chat_id = utils.get_peer_id(update.peer)
         if not channels.accepts(chat_id):
-            print(f"join request in {chat_id} ignored (not registered)")
+            held = _skipped.setdefault(chat_id, {})
+            first = not held
+            if len(held) < _SKIPPED_MAX:
+                held[update.user_id] = None
+            # Count instead of printing every time: an unwatched channel can
+            # produce hundreds of requests and drown the log.
+            if first or len(held) % 25 == 0:
+                print(f"join request from {update.user_id} in {chat_id} ignored "
+                      f"(not registered) [{len(held)} held for /add {chat_id}]")
+            if first:
+                await notify_unregistered(update.peer, chat_id)
             return
 
         uid = update.user_id
@@ -165,10 +238,15 @@ def build_bot() -> TelegramClient:
 
         added = channels.add(chat_id, title)
         label = _fmt_chat(chat_id, title)
+        held = list(_skipped.pop(chat_id, {}))
         await event.reply(
             (f"Added {label}" if added else f"Already watching {label}")
             + f"\nChannels: {channels.count()}"
+            + (f"\nDelivering to {len(held)} requesters seen before it was added"
+               if held else "")
         )
+        if held:
+            asyncio.create_task(flush_held(chat_id, held, event))
 
     # --- 2. Owner: /remove --------------------------------------------------
     @bot.on(events.NewMessage(pattern=_cmd("remove", "del")))
@@ -279,13 +357,19 @@ def build_bot() -> TelegramClient:
     async def on_stats(event):
         if not _is_owner(event):
             return
-        await event.reply(
-            f"Audience: {audience.count()}\n"
-            f"Channels: {channels.count()}\n"
-            f"Saved post: {'set' if saved_post.exists() else 'none'}\n"
-            f"Buttons: {buttons.count()}\n"
-            f"Broadcast running: {'yes' if _state.running else 'no'}"
-        )
+        lines = [
+            f"Audience: {audience.count()}",
+            f"Channels: {channels.count()}",
+        ]
+        for cid, users in sorted(_skipped.items()):
+            if users:
+                lines.append(f"Held in {cid}: {len(users)}")
+        lines += [
+            f"Saved post: {'set' if saved_post.exists() else 'none'}",
+            f"Buttons: {buttons.count()}",
+            f"Broadcast running: {'yes' if _state.running else 'no'}",
+        ]
+        await event.reply("\n".join(lines))
 
     # --- 2. Owner: /cancel --------------------------------------------------
     @bot.on(events.NewMessage(pattern=_cmd("cancel")))
