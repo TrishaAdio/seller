@@ -1,8 +1,7 @@
-"""Persistent broadcast audience — the set of user ids the bot can post to.
+"""Persistent broadcast audience — the user ids the bot can post to.
 
-Grows over time: seeded from the pending-request backlog and topped up with
-every new live join-requester. Stored as a plain JSON array in
-data/audience.json.
+Grows with every join requester the bot sees on a registered channel. Stored as
+a plain JSON array in data/audience.json.
 """
 from __future__ import annotations
 
@@ -48,13 +47,5 @@ def all_ids() -> list[int]:
     return sorted(load_ids())
 
 
-def merged_with_pending() -> list[int]:
-    """Audience unioned with the raw pending-request dump (belt and braces)."""
-    ids = load_ids()
-    if config.PENDING_FILE.exists():
-        try:
-            pending = json.loads(config.PENDING_FILE.read_text())
-            ids.update(u["user_id"] for u in pending)
-        except (ValueError, OSError, KeyError, TypeError):
-            pass
-    return sorted(ids)
+def count() -> int:
+    return len(load_ids())

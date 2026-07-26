@@ -1,7 +1,8 @@
 """Broadcast engine — replicate ONE message (any format) to the whole audience.
 
-The owner replies to a post with /broadcast; we copy that exact message to
-every recipient. "Copy" (not forward) means no "forwarded from" header.
+The owner replies to a post with /broadcast (or /bcast); we copy that exact
+message to every recipient. "Copy" (not forward) means no "forwarded from"
+header.
 
 Format support: text, photo, video, document, audio, voice, sticker, GIF —
 whatever the owner sent. Captions and all text formatting are preserved,
@@ -12,7 +13,6 @@ so we simply pass the original entities straight through.
 from __future__ import annotations
 
 import asyncio
-import json
 
 from telethon import TelegramClient, utils
 from telethon.errors import (
@@ -27,6 +27,7 @@ from telethon.errors import (
 from telethon.tl.types import InputPeerUser, Message, MessageMediaWebPage
 
 import buttons as buttons_store
+import channels
 import config
 import saved_post
 
@@ -40,26 +41,13 @@ def _utf16_len(text: str) -> int:
     return len(text.encode("utf-16-le")) // 2
 
 
-def pending_username_map() -> dict:
-    """Map of user_id -> @username from the fetched backlog (usernames only)."""
-    if not config.PENDING_FILE.exists():
-        return {}
-    try:
-        data = json.loads(config.PENDING_FILE.read_text())
-        return {u["user_id"]: u["username"] for u in data if u.get("username")}
-    except Exception:
-        return {}
-
-
-async def _resolve_send_peer(bot: TelegramClient, target, username: str | None = None):
-    """Turn a target into a sendable peer, trying hardest to get a REAL peer.
+async def _resolve_send_peer(bot: TelegramClient, target):
+    """Turn a target into a sendable peer.
 
     Order:
       1) already an entity/InputPeer -> use as-is
-      2) cached access hash (live join requesters, seen via update)
-      3) resolve the public @username (the only way to reach an OLD requester
-         the bot never saw — works only if the user has a username)
-      4) last resort access_hash 0 (usually rejected for uncached users)
+      2) cached access hash (join requesters the bot saw live)
+      3) last resort access_hash 0
     """
     if not isinstance(target, int):
         return target
@@ -67,11 +55,6 @@ async def _resolve_send_peer(bot: TelegramClient, target, username: str | None =
         return await bot.get_input_entity(target)
     except (ValueError, TypeError):
         pass
-    if username:
-        try:
-            return await bot.get_input_entity(username)
-        except Exception:
-            pass
     return InputPeerUser(target, 0)
 
 
@@ -79,45 +62,44 @@ async def _warm_saved_peer(bot: TelegramClient, chat_id: int):
     """Return a sendable peer for the saved post's chat, warming the bot's entity
     cache when a bare numeric channel id isn't known yet.
 
-    Why this exists: the saved post is stored only as (chat_id, message_id). The
-    chat_id is usually a numeric channel id (-100...). To fetch a message by that
-    id the bot needs the channel's access_hash in its session entity cache. On a
-    FRESH session (new VPS) or after a restart that cache can be cold, so a bare
+    Why this exists: the saved post is stored only as (chat_id, message_id). To
+    fetch a message by a numeric channel id the bot needs that channel's
+    access_hash in its session entity cache. On a FRESH session (new VPS) or
+    after a restart that cache can be cold, so a bare
     `get_messages(-100..., ...)` raises 'Could not find the input entity'.
 
-    Unlike the userbot, a bot CANNOT warm its cache with iter_dialogs, so we lean
-    on the configured SOURCE_CHANNEL: resolving it (public @username resolves
-    directly; a numeric/invite ident resolves once reachable) populates the cache
-    for that channel id, after which the saved-post fetch succeeds.
+    A bot cannot warm its cache with iter_dialogs, so we lean on the registered
+    channels: resolving one populates the cache for its id.
     """
     # 1) Already cached (from a prior update / interaction)?
     try:
         return await bot.get_input_entity(chat_id)
     except (ValueError, TypeError):
         pass
-    # 2) Warm via the configured source channel — the saved post normally lives
-    #    in the channel the bot administers.
-    ident = config.channel_ident()
-    if ident:
+    # 2) Warm via the registered channels — a saved post that lives in a channel
+    #    normally lives in one the bot administers.
+    for ident in channels.all_ids():
         try:
             ent = await bot.get_entity(ident)
-            if utils.get_peer_id(ent) == chat_id:
-                return ent
-            # Different chat than SOURCE_CHANNEL, but the cache may be warm now.
-            return await bot.get_input_entity(chat_id)
         except Exception as exc:  # noqa: BLE001
-            print(f"resolve_saved: could not warm channel {ident!r}: "
+            print(f"resolve_saved: could not warm channel {ident}: "
                   f"{type(exc).__name__}: {exc}")
+            continue
+        if utils.get_peer_id(ent) == chat_id:
+            return ent
     # 3) Last resort: let get_messages try the raw id again.
-    return chat_id
+    try:
+        return await bot.get_input_entity(chat_id)
+    except (ValueError, TypeError):
+        return chat_id
 
 
 async def resolve_saved(bot: TelegramClient) -> Message | None:
     """Fetch the owner's saved-post Message, or None if unset/deleted.
 
     Failures are LOGGED (not silently swallowed) so a genuine problem — cold
-    entity cache, expired file reference, auth — is visible instead of silently
-    degrading to the plain-text fallback and dropping the premium/custom emoji.
+    entity cache, expired file reference, auth — is visible instead of the post
+    quietly going missing.
     """
     info = saved_post.load()
     if not info:
@@ -139,10 +121,8 @@ async def resolve_saved(bot: TelegramClient) -> Message | None:
         return await bot.get_messages(peer, ids=message_id)
     except Exception as exc:  # noqa: BLE001
         print(f"resolve_saved: could not fetch saved post {chat_id}/{message_id} "
-              f"after warming: {type(exc).__name__}: {exc}. NOTE: falling back "
-              "means the saved post (and its premium/custom emoji) will NOT be "
-              "sent. Re-run /setpost from this machine, or ensure the bot has "
-              "seen SOURCE_CHANNEL.")
+              f"after warming: {type(exc).__name__}: {exc}. Re-run /setpost, or "
+              "make sure the bot has seen the channel the post lives in.")
         return None
 
 
@@ -171,21 +151,20 @@ class BroadcastState:
         self.cancel = False
 
 
-async def _copy_to(bot: TelegramClient, target, src: Message, markup="__default__",
-                   username: str | None = None) -> str:
+async def _copy_to(bot: TelegramClient, target, src: Message,
+                   markup="__default__") -> str:
     """Send a copy of `src` to one target (user id or entity).
 
     Preserves media, caption, all formatting (incl. premium/custom emoji), and
     the spoiler flag. If the caption is too long for the bot's media-caption
     limit, the media is sent first and the full text follows as its own message
     so no URLs/text are lost. `markup` defaults to the configured /setbutton
-    buttons; pass None to force no buttons. `username` lets old requesters be
-    resolved by @username when the bot has no cached access hash.
+    buttons; pass None to force no buttons.
     """
     if markup == "__default__":
         markup = buttons_store.to_markup()
 
-    peer = await _resolve_send_peer(bot, target, username)
+    peer = await _resolve_send_peer(bot, target)
 
     async def _send(message: Message) -> None:
         # entities carry the premium/custom emoji (MessageEntityCustomEmoji) and
@@ -273,36 +252,30 @@ async def run_broadcast(
     targets: list[int],
     state: BroadcastState,
     progress=None,
-    usernames: dict | None = None,
 ) -> dict:
     """Copy `src` to every id in `targets`, paced and cancellable.
 
     `progress` (optional) is an async callable(done, stats) invoked periodically.
-    `usernames` (optional) maps user_id -> @username so old requesters the bot
-    never saw can still be resolved. Returns a stats dict. Stops early on
-    PeerFloodError (hard rate limit).
+    Returns a stats dict. Stops early on PeerFloodError (hard rate limit).
     """
     state.running = True
     state.cancel = False
     stats = _new_stats(len(targets))
     done = 0
     markup = buttons_store.to_markup()  # resolve once for the whole run
-    if usernames is None:
-        usernames = pending_username_map()
     try:
         for user_id in targets:
             if state.cancel:
                 break
 
-            uname = usernames.get(user_id)
-            status = await _copy_to(bot, user_id, src, markup=markup, username=uname)
+            status = await _copy_to(bot, user_id, src, markup=markup)
 
             # Wait out short flood requests once, then retry the same user.
             if status.startswith("flood:"):
                 wait = int(status.split(":", 1)[1])
                 if wait <= 300:
                     await asyncio.sleep(wait + 1)
-                    status = await _copy_to(bot, user_id, src, markup=markup, username=uname)
+                    status = await _copy_to(bot, user_id, src, markup=markup)
 
             if status == "sent":
                 stats["sent"] += 1
