@@ -1,120 +1,102 @@
-# Channel Migration + Broadcast Bot (Telethon)
+# Join-Request Welcome + Broadcast Bot (Telethon)
 
-Reach everyone who requested to join your channel and move them to a new/backup
-channel — and keep posting to them afterwards.
+One long-running bot. It watches the channels you register, DMs every new join
+requester your saved post, collects them into a broadcast audience, and lets you
+push any post to that audience later.
 
 The content is a single **saved post** you set once with `/setpost`. It can be a
-**video with caption, a photo, plain text, anything** — with **premium emoji** —
-and the bot sends that exact post as-is. There is **no mandatory "new channel
-link" setting**; whatever you put in the post is what people receive.
+video with caption, a photo, plain text, anything — including **premium emoji**
+and spoilers — and the bot sends that exact post as-is.
 
-- **Bot** does all the sending (it's allowed to message pending join-requesters).
-- **Userbot** (your own account) lists the existing backlog, which the Bot API
-  can't do.
-
-## Why a bot *and* a userbot?
+## Why this works
 
 Telegram lets a bot message a user **only** when that user has a *pending join
 request* in a channel where the bot is an admin. That's the whole trick — it's
-why this reaches people who never messaged the bot first.
-
-|                              | Bot | Userbot (your account) |
-|------------------------------|-----|------------------------|
-| Send to a pending requester  | ✅  | ❌ (would be spam/ban) |
-| Get live "new request" event | ✅  | —                      |
-| **List** existing pending requests | ❌ (no Bot API method) | ✅ |
-
-So: the **userbot enumerates** the backlog → the **bot sends** the post. New
-requests after that are welcomed live by the bot, which also collects everyone
-into a **broadcast audience** you can post to any time.
+why this reaches people who never messaged the bot first. The bot gets the
+request as a live update, so it can always reach that user, and it remembers
+them for future broadcasts.
 
 ## Quick start
 
 ```bash
 pip install -r requirements.txt
-python setup.py          # interactive: asks for creds + logs you in
-```
-
-`setup.py` prompts for `API_ID` / `API_HASH` (from https://my.telegram.org) and
-the bot token (from [@BotFather](https://t.me/BotFather)), then logs in your
-**userbot** (phone → **OTP** code → **2FA** password if set) and the **bot**. It
-auto-detects your `OWNER_ID` and writes `.env`. The channel link / message
-prompts are **optional** — you'll set the real content with `/setpost`.
-
-> Before running the bot: make the **bot an admin** of the source channel with
-> the **"Add users"** right, ensure **your own account is an admin** there too,
-> and turn on **"Approve new members"** (that's what creates join requests).
-
-## Usage
-
-**1) Start the bot and save your post:**
-```bash
+cp .env.example .env      # fill in API_ID, API_HASH, BOT_TOKEN, OWNER_ID
 python live_bot.py
 ```
-Then DM the bot: send the post you want (video/photo/text + premium emoji) and
-**reply to it with `/setpost`**. Use `/preview` to see exactly what recipients
-will get. From now on every **new** join requester is auto-sent that post.
 
-**2) List the existing backlog** (userbot):
-```bash
-python fetch_pending.py
-```
-→ writes `data/pending_users.json` and seeds `data/audience.json`.
+Then, in each channel you want to serve:
 
-**3) Send the saved post to the backlog** (bot, paced + resume-safe):
-```bash
-python dm_backlog.py
-```
+1. Make the bot an **admin** with the **"Add users"** right.
+2. Turn on **"Approve new members"** (that's what creates join requests).
+3. DM the bot `/add <chat_id>` (e.g. `/add -1001234567890`, or `/add @channel`).
 
-Or skip step 3 and just use `/broadcast` from the bot — it targets the whole
-audience (backlog included).
+Finally, DM the bot the post you want to send and **reply to it with
+`/setpost`**. Use `/preview` to see exactly what recipients will get.
 
 ## Owner commands (DM the bot)
 
-| Command       | What it does                                                        |
-|---------------|---------------------------------------------------------------------|
-| `/start`      | Show the owner help panel                                           |
-| `/setpost`    | **Reply** to a message to save it as THE post                       |
-| `/clearpost`  | Forget the saved post                                               |
-| `/preview`    | Send the saved post to yourself                                     |
-| `/broadcast`  | Push the saved post (or a replied post) to the whole audience       |
-| `/stats`      | Audience size + whether a post is set + broadcast state             |
-| `/cancel`     | Stop a running broadcast after the current message                  |
+| Command             | What it does                                             |
+|---------------------|----------------------------------------------------------|
+| `/start`            | Show the owner panel                                     |
+| `/add <chat_id>`    | Watch that channel's join requests                        |
+| `/remove <chat_id>` | Stop watching that channel                                |
+| `/chats`            | List watched channels                                     |
+| `/setpost`          | **Reply** to a message to save it as THE post             |
+| `/clearpost`        | Forget the saved post                                     |
+| `/setbutton`        | Inline URL buttons for the post                           |
+| `/clearbutton`      | Remove the buttons                                        |
+| `/preview`          | Send the saved post to yourself                           |
+| `/broadcast`        | Push the saved post (or a replied post) to the audience    |
+| `/bcast`            | Alias of `/broadcast`                                     |
+| `/stats`            | Audience + channels + post/button status                  |
+| `/cancel`           | Stop a running broadcast after the current message         |
+
+`/add` accepts a `-100…` id, a bare channel id, an `@username`, or a t.me link.
+While no channel is registered the bot handles join requests from **every** chat
+it administers; once one is added, only registered chats are handled.
 
 The bot copies the post (no "forwarded from" tag) and edits a live progress
-message as it goes.
+message as a broadcast runs.
+
+### Buttons
+
+```
+/setbutton
+Join - https://t.me/x | Chat - https://t.me/y
+Website - https://example.com
+```
+
+Each line is a row; `|` splits buttons within a row.
 
 ### Premium / custom emoji
 
 Custom (premium) emoji are part of the message as `MessageEntityCustomEmoji`
-entities. Because we re-send the post by reference, those entities are preserved
+entities. Because the post is re-sent by reference, those entities are preserved
 and render for all recipients. Bots gained the right to send custom emoji in
-**Bot API 9.4** (Feb 2026) — see the
+**Bot API 9.4** — see the
 [Bot API changelog](https://core.telegram.org/bots/api-changelog).
 *Content rephrased for compliance with licensing restrictions.*
 
 ## Files
 
-| File               | Role                                                          |
-|--------------------|---------------------------------------------------------------|
-| `setup.py`         | Interactive setup: creds + userbot OTP login + writes `.env`  |
-| `config.py`        | Loads `.env`, optional text fallback, paths                   |
-| `fetch_pending.py` | **Userbot**: dumps all pending requesters + seeds audience    |
-| `bot_dm.py`        | Shared bot client + flood-safe single-DM helper (fallback)    |
-| `dm_backlog.py`    | **Bot**: sends the saved post to the backlog, paced + resume  |
-| `live_bot.py`      | **Bot**: auto-welcome new requesters + owner commands         |
-| `broadcast.py`     | Copies any message (media/caption/emoji) to the audience      |
-| `saved_post.py`    | Stores the reference to the owner's saved post                |
-| `audience.py`      | Persistent recipient set (`data/audience.json`)               |
+| File            | Role                                                        |
+|-----------------|-------------------------------------------------------------|
+| `live_bot.py`   | The bot: auto-welcome, channel registry, owner commands      |
+| `config.py`     | Loads `.env`, paths                                          |
+| `channels.py`   | Watched channels (`data/channels.json`, `/add` + `/remove`)  |
+| `audience.py`   | Persistent recipient set (`data/audience.json`)              |
+| `broadcast.py`  | Copies any message (media/caption/emoji) to the audience     |
+| `saved_post.py` | Stores the reference to the owner's saved post               |
+| `buttons.py`    | Inline URL buttons (`data/buttons.json`)                     |
 
-## Important notes
+## Notes
 
 - **Pace it.** Sending to thousands fast will trip `PeerFloodError` and can
   limit the bot. Defaults are conservative; slower is safer. Broadcasts stop
   cleanly on a hard rate limit — just re-run later.
-- **Only reaches people who requested to join / already got the post.** That's
-  the one case Telegram permits, which keeps this legitimate rather than spam.
-- **Userbots are real accounts driven by the API** (a gray area in Telegram's
-  ToS). Use a dedicated account and keep its role limited to just listing.
+- **Only reaches people who requested to join.** That's the one case Telegram
+  permits, which keeps this legitimate rather than spam.
+- Old join requests made *before* the bot was added can't be enumerated by a
+  bot (the Bot API has no method to list them) — only live requests are caught.
 - **Never commit `.env` or `*.session`** — they're your logins. `.gitignore`
   already excludes them.
